@@ -1,0 +1,106 @@
+name: Build and Publish Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      vllm_commit:
+        description: "vLLM git ref to build against (tag, branch, or sha)"
+        type: string
+        default: "v0.20.0"
+      publish:
+        description: "Publish to GHCR (only for repo maintainers)"
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Skip PRs from forks for registry writes
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VLLM_COMMIT=${{ github.event.inputs.vllm_commit || 'v0.20.0' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  usage-note:
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Print usage
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "### Image published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# LLM service (port 8000)" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -d --name vllm-llm --privileged \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --ipc host --shm-size 16gb -p 8000:8000 \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -v /path/to/hf-cache:/models:ro \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -e SERVICE_MODE=llm \\" >> $GITHUB_STEP_SUMMARY
+          echo "  ${IMAGE}:main" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# ASR service (port 8001)" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -d --name vllm-asr --privileged \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --ipc host --shm-size 16gb -p 8001:8000 \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -v /path/to/hf-cache:/models:ro \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -e SERVICE_MODE=asr \\" >> $GITHUB_STEP_SUMMARY
+          echo "  ${IMAGE}:main" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
