@@ -96,6 +96,11 @@ RUN if [ -n "$VLLM_COMMIT" ]; then \
 COPY scripts/patch_strix.py /opt/vllm/patch_strix.py
 RUN python /opt/vllm/patch_strix.py
 
+# 7c. Profile cache module — imported at runtime by Patch 16 to skip
+# ~7 min memory profiling on restart. Kept in site-packages so Python
+# finds it via a plain `import vllm_profile_cache`.
+COPY scripts/vllm_profile_cache.py /opt/venv/lib/python3.12/site-packages/vllm_profile_cache.py
+
 # 7b. pkg-config  -  required by ROCm 7.13's rocm_smi-config.cmake which
 # vLLM's find_package(Torch) → Caffe2 → LoadHIP chain pulls in. Kept as
 # a separate RUN here (rather than in step 1) so adding it doesn't
@@ -141,6 +146,14 @@ RUN TORCH_VER=$(python -c "import torch; print(torch.__version__)") && \
       -r /opt/vllm/requirements/rocm.txt \
       --constraint /tmp/constraints.txt && \
     rm -rf /root/.cache/uv /root/.cache/pip /tmp/constraints.txt
+
+# 8c. Audio support dependencies — required for Qwen3-ASR transcription
+# and realtime endpoints. PyAV bundles FFmpeg binaries (libavcodec,
+# libswresample) so no system-level ffmpeg is needed. soundfile provides
+# a fallback audio loader (libsndfile). scipy supplies resample_poly as
+# an alternative resampler. pybase64 is already in common.txt.
+RUN uv pip install av soundfile scipy && \
+    rm -rf /root/.cache/uv /root/.cache/pip
 
 # 9. Runtime env. Mirrors /etc/profile.d/rocm-sdk.sh for non-interactive use.
 # These are the env vars our research found load-bearing for AWQ vision

@@ -28,6 +28,46 @@
 
 ---
 
+## 📋 Project overview
+
+This is a **Docker-based deployment and benchmarking project** for running the **Qwen 3.6-27B language model** (quantized to AWQ-INT4) on **AMD Strix Halo** hardware (gfx1151 / RDNA 3.5 integrated GPU). It is not a library or framework — it is a self-contained infrastructure repo that builds vLLM from source with hardware-specific patches, then serves the model through an OpenAI-compatible API.
+
+The headline achievement: **24.8 tokens/sec peak** single-stream decode throughput (with DFlash speculative decoding), a +340% improvement over the no-speculative baseline of 5.6 t/s, on a fanless consumer integrated GPU.
+
+### Architecture
+
+| Layer | Component | Detail |
+|---|---|---|
+| Model | Qwen 3.6-27B (cyankiwi AWQ-INT4, W4A16, group_size 32) | ~14 GiB on disk; vision blocks kept BF16 |
+| Inference engine | vLLM v0.20.0 (built from source) | OpenAI-compatible API on port 8000 |
+| GPU | AMD Strix Halo / gfx1151 / RDNA 3.5 (iGPU) | 128 GB UMA pool, GTT-on-demand |
+| GPU stack | TheRock ROCm 7.13 nightly | Non-official nightly build from `rocm.nightlies.amd.com` |
+| Deep learning | PyTorch 2.10 + Triton 3.6 (ROCm nightly) | gfx1151-specific wheel index |
+| Speculative decoding | DFlash (`z-lab/Qwen3.6-27B-DFlash`, ~2B BF16) | N=8 speculative tokens; drafter has 4 SWA + 1 full attention layers |
+| AWQ kernels | `conch-triton-kernels` | Required for AWQMarlin-on-ROCm path |
+| Containerization | Docker Compose | Single service, `--enforce-eager` (HIP graphs freeze on gfx1151) |
+| CLI client | `glados.py` — pure Python stdlib | REPL + one-shot + benchmark, SSE streaming via `/v1/responses` |
+
+### What the server provides
+
+Three OpenAI-compatible endpoints:
+
+- **`/v1/chat/completions`** — Standard chat completion API with thinking mode, vision, and tool calling (non-streaming recommended for tools due to upstream parser bugs)
+- **`/v1/responses`** — OpenAI Responses API with reasoning/text channels separated via SSE streaming (the preferred endpoint for agents and streaming reasoning)
+- **`/v1/completions`** — Raw text completion
+
+Model capabilities: 256K native context (232K usable after vLLM padding), vision/image input (ViT tower preserved at BF16), tool calling via the `qwen3_coder` parser, and thinking/reasoning mode with `` token separation.
+
+### Deliberately excluded
+
+- Flash-Attention (2.2-3.7x ViT regression on gfx1151)
+- AITER custom build (disabled at runtime via `VLLM_ROCM_USE_AITER=0`; CDNA-only kernels)
+- bitsandbytes ROCm (AWQ via compressed-tensors instead)
+- Custom RCCL (single iGPU, no NCCL needed)
+- HIP graph capture (documented freeze class on gfx1151)
+
+---
+
 ## ⚡ The numbers
 
 | | Single-stream t/s | Hardware |
@@ -211,7 +251,7 @@ Per-position acceptance falls off as N grows (drafter is less confident predicti
 | Context | 256K | 256K | 256K |
 | Vision support | ✅ | ✅ | ✅ |
 | Hardware | AMD iGPU, ROCm 7.13 | NVIDIA GB10 Blackwell | NVIDIA GB10 Blackwell sm_121a |
-| Stack | Upstream vLLM v0.20.0 + 17 patches | Upstream vLLM | Custom CUDA 13 + FlashInfer 0.6.8 + sm_121a-only |
+| Stack | Upstream vLLM v0.20.0 + 20 patches | Upstream vLLM | Custom CUDA 13 + FlashInfer 0.6.8 + sm_121a-only |
 | Open source toolchain | 100% | mostly | partly (NVFP4 kernels are NVIDIA's) |
 
 **Sources cited above:**
@@ -281,7 +321,7 @@ wait
 ```bash
 docker compose build
 ```
-Multi-stage: TheRock ROCm 7.13 nightly tarball → PyTorch from `rocm.nightlies.amd.com/v2-staging/gfx1151/` → vLLM v0.20.0 source → 16 idempotent string-replace patches → C/HIP extensions for gfx1151.
+Multi-stage: TheRock ROCm 7.13 nightly tarball → PyTorch from `rocm.nightlies.amd.com/v2-staging/gfx1151/` → vLLM v0.20.0 source → 20 idempotent string-replace patches → C/HIP extensions for gfx1151.
 
 ### 7. Boot the engine
 ```bash
@@ -426,6 +466,100 @@ These are gfx1151-driven, not quant-driven. Same patches the BF16 sibling repo u
 
 ---
 
+## 🔍 vs official vLLM 0.20.0 ROCm support
+
+The table below compares what vLLM 0.20.0 ships out-of-the-box for ROCm versus what this repo actually uses. Official vLLM targets data-center MI300/MI325 GPUs first; RDNA APU support is "works but not optimized" level. This repo is the opposite: gfx1151-only, stripped of all multi-GPU/datacenter features.
+
+### GPU & SDK
+
+| Component | Official vLLM 0.20.0 | This repo |
+|---|---|---|
+| Supported GPUs | MI300A/X/325X (gfx94x), RX 7900 XTX (gfx1100), Strix Point (gfx1150), Strix Halo (gfx1151), RX 9070 XT (gfx1201) | Strix Halo (gfx1151) only |
+| Device detection | Built-in mapping table, auto-detect via amdsmi/torch.cuda | Patch-forced `HSA_OVERRIDE_GFX_VERSION=11.5.1` |
+| ROCm version | 7.2.1 (stable release) | TheRock 7.13 nightly (unofficial) |
+| Base image | `rocm/dev-ubuntu-22.04:7.2.1-complete` | Ubuntu 26.04 + TheRock nightly tarball |
+| Python management | pip | `uv` |
+
+### Attention backends
+
+| Backend | Official vLLM 0.20.0 | This repo | Note |
+|---|---|---|---|
+| **ROCM_ATTN** (default) | Paged attention + Triton prefix prefill | LM main model | Natively supported |
+| **TRITON_ATTN** (fallback) | Pure Triton attention | ViT vision encoder | Forced manually; auto backend produces NaN/Inf on gfx1151 |
+| ROCM_AITER_FA | AITER flash attention | Disabled | AITER requires gfx9 (MI300+); gfx1151 unsupported |
+| ROCM_AITER_UNIFIED_ATTN | AITER unified attention | Disabled | Same |
+| TURBOQUANT | Quantized attention | Not used | |
+| FLASH_ATTN | Dao-AILab flash-attention | Disabled | ViT 2.2-3.7x regression on gfx1151 |
+
+### Quantization
+
+| Method | Official vLLM 0.20.0 | This repo |
+|---|---|---|
+| AWQ | Supported via `VLLM_USE_TRITON_AWQ=1` | `conch-triton-kernels` (AWQMarlin-on-ROCm path) |
+| GPTQ | Supported | Not used |
+| FP8 (FNUZ) | gfx94x only | N/A (Strix Halo has no FP8) |
+| Compressed-tensors | Supported | AWQ runtime path |
+| GGUF | Supported | Not used (Patch 11 adds qwen35 alias) |
+| BitsAndBytes | Supported | Excluded |
+| MXFP4 / TorchAO / Quark | Supported | Not used |
+
+### AITER components
+
+All AITER features are **disabled** in this repo because `is_aiter_found_and_supported()` in official vLLM checks `on_mi3xx()` — AITER kernels are CDNA-only (gfx94x/gfx95x) and physically cannot run on RDNA (gfx11xx/gfx12xx). The official default is `VLLM_ROCM_USE_AITER=False` anyway.
+
+| AITER feature | Official default | This repo |
+|---|---|---|
+| Linear / GEMM | `True` (but guarded by `on_mi3xx()`) | `VLLM_ROCM_USE_AITER=0` |
+| MoE fused ops | `True` | Disabled |
+| RMSNorm | `True` | Disabled |
+| MLA decode | `True` | Disabled (DeepSeek-only) |
+| MHA / flash attention | `True` | Disabled |
+| FP8 / FP4 BMM | `True` | Disabled |
+
+### Speculative decoding
+
+| Method | Official vLLM 0.20.0 | This repo |
+|---|---|---|
+| Eagle/Eagle3 | Supported (tested with AITER MLA) | Not used |
+| **DFlash** | Supported | Core optimization driver (+340% throughput) |
+| N-gram | Supported (via numba) | Not used |
+| Medusa | Supported | Not used |
+| SWA in DFlash drafter | PR #40898 (open upstream) | Patch 14 cherry-pick |
+| Non-causal attention on ROCM_ATTN | PR #40176 (merged to main, not in v0.20.0 tag) | Patch 13 cherry-pick |
+
+### Communication & parallelism
+
+| Component | Official vLLM 0.20.0 | This repo |
+|---|---|---|
+| Custom all-reduce | MI300 series (gfx94x/gfx95x) | N/A (single iGPU) |
+| RCCL / NCCL | UCX + RIXL + rocshmem + DeepEP | Excluded (single GPU) |
+| MORI expert parallelism | Supported (with AMD AINIC) | N/A |
+| NUMA-aware detection | Supported | Not used |
+
+### Docker build
+
+| Aspect | Official vLLM 0.20.0 | This repo |
+|---|---|---|
+| Stages | 4 (vLLM / UCX / DeepEP / MORI proxy) | Single stage |
+| Network acceleration | UCX + RIXL + DeepEP + MORI | None |
+| Flash Attention | Dao-AILab, fixed commit, built from source | Installed but disabled at runtime |
+| AITER | v0.1.10.post3, built from source | Not installed |
+| Triton | ROCm fork, fixed commit | Triton 3.6 (nightly gfx1151 wheel) |
+
+### 20 patches — upstream status
+
+| Patches | Source | Content | Upstream status |
+|---|---|---|---|
+| 1-12 | kyuz0/amd-strix-halo-vllm-toolboxes | gfx1151 hardware enablement (amdsmi disable, arch detection, CDNA-only feature guards, JIT path fixes, APU VRAM margin, etc.) | Partially merged; some still pending |
+| 13 | PR #40176 | ROCM_ATTN non-causal attention for DFlash | Merged to main (not in v0.20.0 tag) |
+| 14 | PR #40898 | DFlash drafter SWA support + `target_layer_ids` +1 off-by-one fix | Open |
+| 15 | Local | Thread `chat_template_kwargs` through `/v1/responses` streaming path | Not filed |
+| 16 | Local | Cache profile_run results to skip ~7 min memory profiling on restart | N/A (repo-specific optimization) |
+| 17 | PR #40334 | dtype cast in `combine_hidden_states` for AWQ mixed-precision targets | Open |
+| 18 | Local | Fix non-streaming `/v1/responses` with `enable_thinking=false` (pass kwargs + `is_reasoning_end` safety net) | Worth filing upstream |
+
+---
+
 
 ## 🥨 Sibling repos (same hardware, different quants)
 
@@ -452,9 +586,14 @@ These are gfx1151-driven, not quant-driven. Same patches the BF16 sibling repo u
 ├── docker-compose.yml       # one service, restart=no, --enforce-eager, DFlash N=8
 ├── .env.template            # the one config file you edit
 ├── glados.py                # tiny REPL/one-shot CLI for fast testing (no deps, stdlib only)
+├── docs/
+│   ├── GUIDE.md                   # 从零开始的全流程使用指南
+│   ├── LLM.md                     # Qwen3.6-27B 文本大模型部署指南
+│   └── ASR.md                     # Qwen3-ASR 语音识别部署指南
 ├── scripts/
 │   ├── install_rocm_sdk.sh  # TheRock nightly tarball → /opt/rocm (via rocm.nightlies.amd.com mirror, ~50× faster than the S3 origin from EU/non-US-East-2)
-│   ├── patch_strix.py       # 17 idempotent string-replace patches (1147 LOC) - 12 from kyuz0 (verbatim) + Patch 13/14 (PR cherry-picks) + Patch 15 (local fix for /v1/responses chat_template_kwargs)
+│   ├── patch_strix.py       # 20 idempotent string-replace patches - 12 from kyuz0 (verbatim) + Patch 13/14 (PR cherry-picks) + Patch 15 (streaming chat_template_kwargs) + Patch 16 (profile cache) + Patch 17 (PR #40334 dtype fix) + Patch 18 (non-streaming enable_thinking fix)
+│   ├── vllm_profile_cache.py # stdlib-only module: fingerprint + cache KV cache memory sizing results
 │   └── dump_logs.sh         # snapshot engine + kernel logs before any down/restart
 ├── test/
 │   ├── bench.py                       # original 5-endpoint harness (peso prompt)
@@ -465,7 +604,7 @@ These are gfx1151-driven, not quant-driven. Same patches the BF16 sibling repo u
 └── README.md
 ```
 
-13 user-written files (plus `.gitignore`). No vendored binaries, no untracked tarballs.
+14 user-written files (plus `.gitignore`). No vendored binaries, no untracked tarballs.
 
 ---
 

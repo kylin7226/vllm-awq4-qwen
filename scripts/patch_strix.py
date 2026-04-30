@@ -1141,6 +1141,240 @@ except Exception:
 
         p_responses_proto.write_text(txt)
 
+    # ----------------------------------------------------------------
+    # Patch 16: Cache profile_run results to skip ~7 min memory
+    # profiling on restart.
+    #
+    # vLLM runs synthetic forward passes every boot to size the KV cache.
+    # On Strix Halo with --enforce-eager, the dominant cost is Triton JIT
+    # compilation + dummy runs, not cudagraph capture. Since the Triton
+    # cache is already persisted to disk, the profile result is stable
+    # across restarts for the same config.
+    #
+    # This patch checks for a cached KV cache memory value at the top of
+    # GPUWorker.determine_available_memory(). If found, it returns
+    # immediately (skipping profile_run). Otherwise it runs normal
+    # profiling and caches the result for the next restart.
+    #
+    # Controlled by VLLM_SKIP_MEMORY_PROFILING=1 (opt-in) and
+    # VLLM_PROFILE_CACHE_DIR (defaults to /root/.cache/vllm-profile).
+    # The cache module (vllm_profile_cache.py) is copied into the image
+    # at /opt/vllm_profile_cache.py by the Dockerfile.
+    # ----------------------------------------------------------------
+    p_gpu_worker = Path('vllm/v1/worker/gpu_worker.py')
+    if p_gpu_worker.exists():
+        txt = p_gpu_worker.read_text()
+
+        # 16a: Insert cache read at the top of determine_available_memory().
+        read_anchor = (
+            '        """\n'
+            '        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:\n'
+            '            # still need a profile run which compiles the model for\n'
+            '            # max_num_batched_tokens\n'
+            '            self.model_runner.profile_run()\n'
+        )
+        read_replacement = (
+            '        """\n'
+            '        # Strix Halo Patch 16: Try to use cached profile result\n'
+            '        # to skip ~7 min memory profiling on restart.\n'
+            '        if envs.VLLM_SKIP_MEMORY_PROFILING:\n'
+            '            try:\n'
+            '                import vllm_profile_cache as _vpc\n'
+            '                cache_dir = envs.VLLM_PROFILE_CACHE_DIR or "/root/.cache/vllm-profile"\n'
+            '                cached = _vpc.read_cached_kv_cache_memory_bytes(cache_dir, self.vllm_config)\n'
+            '                if cached is not None:\n'
+            '                    logger.info(\n'
+            '                        "Using cached KV cache memory from profile_cache: %s GiB",\n'
+            '                        format_gib(cached),\n'
+            '                    )\n'
+            '                    return cached\n'
+            '            except Exception:\n'
+            '                logger.debug("Profile cache read failed; falling back to profiling")\n\n'
+            '        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:\n'
+            '            # still need a profile run which compiles the model for\n'
+            '            # max_num_batched_tokens\n'
+            '            self.model_runner.profile_run()\n'
+        )
+        if "VLLM_SKIP_MEMORY_PROFILING" not in txt and read_anchor in txt:
+            txt = txt.replace(read_anchor, read_replacement, 1)
+            print(" -> Patched vllm/v1/worker/gpu_worker.py (16a: cache read at top of determine_available_memory)")
+
+        # 16b: Insert cache write after computing available_kv_cache_memory_bytes.
+        write_anchor = (
+            '        self.available_kv_cache_memory_bytes = (\n'
+            '            self.requested_memory\n'
+            '            - profile_result.non_kv_cache_memory\n'
+            '            - cudagraph_memory_estimate_applied\n'
+            '        )\n\n'
+            '        unrequested_memory = self.init_snapshot.free_memory - self.requested_memory\n'
+        )
+        write_replacement = (
+            '        self.available_kv_cache_memory_bytes = (\n'
+            '            self.requested_memory\n'
+            '            - profile_result.non_kv_cache_memory\n'
+            '            - cudagraph_memory_estimate_applied\n'
+            '        )\n\n'
+            '        # Strix Halo Patch 16: Cache the result for future restarts.\n'
+            '        if envs.VLLM_SKIP_MEMORY_PROFILING:\n'
+            '            try:\n'
+            '                import vllm_profile_cache as _vpc\n'
+            '                cache_dir = envs.VLLM_PROFILE_CACHE_DIR or "/root/.cache/vllm-profile"\n'
+            '                _vpc.write_cached_kv_cache_memory_bytes(\n'
+            '                    cache_dir, self.available_kv_cache_memory_bytes, self.vllm_config,\n'
+            '                )\n'
+            '                logger.info(\n'
+            '                    "Cached KV cache memory to profile_cache: %s GiB",\n'
+            '                    format_gib(self.available_kv_cache_memory_bytes),\n'
+            '                )\n'
+            '            except Exception:\n'
+            '                logger.debug("Profile cache write failed (non-fatal)")\n\n'
+            '        unrequested_memory = self.init_snapshot.free_memory - self.requested_memory\n'
+        )
+        if "Strix Halo Patch 16" not in txt and write_anchor in txt:
+            txt = txt.replace(write_anchor, write_replacement, 1)
+            print(" -> Patched vllm/v1/worker/gpu_worker.py (16b: cache write after profiling)")
+
+        p_gpu_worker.write_text(txt)
+
+    # ----------------------------------------------------------------
+    # Patch 17: PR #40334 cherry-pick — dtype cast in
+    # combine_hidden_states for mixed-precision targets.
+    #
+    # AWQ-quantized models with unquantized attention layers can output
+    # float32 activations that get passed to the draft head's fc layer
+    # (which expects params_dtype, typically bfloat16). Without this
+    # cast, generation crashes with:
+    #   RuntimeError: expected scalar type Float but found Half
+    #
+    # Upstream PR: https://github.com/vllm-project/vllm/pull/40334
+    # (OPEN as of 2026-04-30)
+    # ----------------------------------------------------------------
+    p_qwen3_dflash = Path('vllm/model_executor/models/qwen3_dflash.py')
+    if p_qwen3_dflash.exists():
+        txt = p_qwen3_dflash.read_text()
+
+        old_block = (
+            '        if not self.model.use_aux_hidden_state:\n'
+            '            return hidden_states\n'
+            '        needs_squeeze = hidden_states.dim() == 1\n'
+            '        if needs_squeeze:\n'
+            '            hidden_states = hidden_states.unsqueeze(0)\n'
+            '        result = self.model.fc(hidden_states)\n'
+        )
+        new_block = (
+            '        if not self.model.use_aux_hidden_state:\n'
+            '            return hidden_states\n'
+            '        # Cast to fc params_dtype to handle mixed-precision\n'
+            '        # targets (e.g. AWQ with unquantized attention layers\n'
+            '        # that output float32 activations).\n'
+            '        if hidden_states.dtype != self.model.fc.params_dtype:\n'
+            '            hidden_states = hidden_states.to(self.model.fc.params_dtype)\n'
+            '        needs_squeeze = hidden_states.dim() == 1\n'
+            '        if needs_squeeze:\n'
+            '            hidden_states = hidden_states.unsqueeze(0)\n'
+            '        result = self.model.fc(hidden_states)\n'
+        )
+        if "hidden_states.dtype != self.model.fc.params_dtype" not in txt and old_block in txt:
+            txt = txt.replace(old_block, new_block, 1)
+            p_qwen3_dflash.write_text(txt)
+            print(" -> Patched vllm/model_executor/models/qwen3_dflash.py (17: PR #40334 dtype cast in combine_hidden_states)")
+
+    # ----------------------------------------------------------------
+    # Patch 18: Fix non-streaming /v1/responses with enable_thinking=false.
+    #
+    # Patch 15 (above) wired chat_template_kwargs through the request
+    # model. But _make_response_output_items() (the non-streaming code
+    # path) creates the parser as self.parser(tokenizer, request.tools)
+    # without passing chat_template_kwargs. So Qwen3ReasoningParser
+    # defaults to thinking_enabled=True and misclassifies output as
+    # reasoning even when the template pre-filled a closed think block.
+    #
+    # Fix is two-part:
+    #   18a: Pass chat_template_kwargs to the parser so it respects
+    #        enable_thinking=false (primary fix).
+    #   18b: Add is_reasoning_end check on prompt_token_ids as a safety
+    #        net. If reasoning already ended in the prompt, skip the
+    #        parser entirely and treat full output as content. This
+    #        mirrors what the streaming path already does.
+    # ----------------------------------------------------------------
+    p_responses_serving = Path('vllm/entrypoints/openai/responses/serving.py')
+    if p_responses_serving.exists():
+        txt = p_responses_serving.read_text()
+
+        # 18a: Pass chat_template_kwargs to the parser.
+        parser_call_old = (
+            '        # Use parser to extract and create response output items\n'
+            '        if self.parser:\n'
+            '            parser = self.parser(tokenizer, request.tools)\n'
+            '            return parser.extract_response_outputs('
+        )
+        parser_call_new = (
+            '        # Use parser to extract and create response output items\n'
+            '        if self.parser:\n'
+            '            parser = self.parser(\n'
+            '                tokenizer,\n'
+            '                request.tools,\n'
+            '                chat_template_kwargs=self._effective_chat_template_kwargs(request),\n'
+            '            )\n'
+            '            return parser.extract_response_outputs('
+        )
+        if "self._effective_chat_template_kwargs(request)" not in txt and parser_call_old in txt:
+            txt = txt.replace(parser_call_old, parser_call_new, 1)
+            print(" -> Patched vllm/entrypoints/openai/responses/serving.py (18a: pass chat_template_kwargs to parser)")
+
+        # 18b: Safety net — skip parser when reasoning already ended in prompt.
+        # Insert right before "if self.parser:" block.
+        safety_anchor = (
+            '        # Use parser to extract and create response output items\n'
+            '        if self.parser:\n'
+        )
+        safety_replacement = (
+            '        # Strix Halo Patch 18b: If reasoning already ended in the\n'
+            '        # prompt (enable_thinking=false pre-fills <think>\\n\\n</think>),\n'
+            '        # skip the parser and treat the full output as content.\n'
+            '        # This mirrors the streaming path behavior.\n'
+            '        reasoning_ended_in_prompt = False\n'
+            '        if (\n'
+            '            self.parser is not None\n'
+            '            and self.parser.reasoning_parser_cls is not None\n'
+            '            and final_res.prompt_token_ids is not None\n'
+            '        ):\n'
+            '            try:\n'
+            '                reasoning_parser = self.parser.reasoning_parser_cls(\n'
+            '                    tokenizer,\n'
+            '                    chat_template_kwargs=self._effective_chat_template_kwargs(request),\n'
+            '                )\n'
+            '                reasoning_ended_in_prompt = reasoning_parser.is_reasoning_end(\n'
+            '                    final_res.prompt_token_ids\n'
+            '                )\n'
+            '            except Exception:\n'
+            '                pass\n'
+            '        if reasoning_ended_in_prompt:\n'
+            '            return [\n'
+            '                ResponseOutputMessage(\n'
+            '                    id=f"msg_{random_uuid()}",\n'
+            '                    content=[\n'
+            '                        ResponseOutputText(\n'
+            '                            text=final_output.text,\n'
+            '                            annotations=[],\n'
+            '                            type="output_text",\n'
+            '                            logprobs=logprobs,\n'
+            '                        )\n'
+            '                    ] if final_output.text else [],\n'
+            '                    role="assistant",\n'
+            '                    status="completed",\n'
+            '                    type="message",\n'
+            '                )\n'
+            '            ]\n\n'
+            '        # Use parser to extract and create response output items\n'
+            '        if self.parser:\n'
+        )
+        if "Strix Halo Patch 18b" not in txt and safety_anchor in txt:
+            txt = txt.replace(safety_anchor, safety_replacement, 1)
+            print(" -> Patched vllm/entrypoints/openai/responses/serving.py (18b: is_reasoning_end safety net)")
+
+        p_responses_serving.write_text(txt)
+
     print("Successfully patched vLLM/Environment for Strix Halo.")
 
 if __name__ == "__main__":
