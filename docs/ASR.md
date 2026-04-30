@@ -158,7 +158,6 @@ curl http://127.0.0.1:8001/v1/models
 适合调试、自定义参数或不在 docker compose 管理的场景：
 
 ```bash
-# 基本命令
 docker run -d \
   --name vllm-asr \
   --privileged \
@@ -415,7 +414,7 @@ curl http://127.0.0.1:8001/v1/audio/transcriptions \
   -F "stream=true"
 ```
 
-**输出示例（SSE events）：**
+**输出示例（SSE 事件）：**
 
 ```
 data: {"id": "trsc-xxx", "object": "transcription.chunk", "created": 1234567890, "model": "Qwen/Qwen3-ASR-8B", "choices": [{"delta": {"text": "你好"}, "finish_reason": null}], "usage": null}

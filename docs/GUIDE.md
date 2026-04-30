@@ -252,8 +252,6 @@ curl http://127.0.0.1:8001/v1/audio/transcriptions \
 | 17 | PR #40334 | `combine_hidden_states` 中的 dtype 转换修复 |
 | 18 | 本地 | 修复非流式 `/v1/responses` + `enable_thinking=false` |
 
-详细补丁说明见 README.md 的 `🛠️ What we contributed` 章节。
-
 ## 十一、运行基准测试
 
 ```bash
@@ -347,7 +345,17 @@ docker logs vllm-awq4-qwen 2>&1 | grep -E "Application startup|Available KV|Cach
 
 > **重要**：遇到卡死状态，先运行 `./scripts/dump_logs.sh stuck-state` 保存诊断信息，再重启容器。
 
-## 十六、相关文档
+## 十六、GitHub Actions 自动构建推送
+
+推送 main 分支或打 tag 后，GitHub Actions 会自动构建 Docker 镜像并推送到 GitHub Container Registry (GHCR)：
+
+- 推送到 `main`：标签为 `:main` + `:latest`
+- 推送 `v*` tag：标签为 `:v1.2.3` + `:v1.2`
+- 也可通过 `workflow_dispatch` 手动触发，可自定义 `VLLM_COMMIT`
+
+镜像地址：`ghcr.io/<你的用户名>/vllm-awq4-qwen`
+
+## 十七、相关文档
 
 - [docs/LLM.md](LLM.md) — Qwen3.6-27B 文本大模型详细部署指南
 - [docs/ASR.md](ASR.md) — Qwen3-ASR 语音识别详细部署指南
