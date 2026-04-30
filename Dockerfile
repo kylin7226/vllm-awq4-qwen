@@ -174,30 +174,5 @@ ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib \
     VLLM_USE_TRITON_AWQ=1 \
     VLLM_DISABLE_COMPILE_CACHE=1
 
-# 10. Runtime defaults — embedded so the image works standalone via
-# `docker run` without docker-compose. All can be overridden at runtime.
-# These mirror .env.template defaults; the entrypoint script assembles
-# them into the correct vLLM serve command.
-ENV VLLM_MODEL_ID=cyankiwi/Qwen3.6-27B-AWQ-INT4 \
-    VLLM_SERVED_MODEL_NAME=Qwen3.6-27B-AWQ4 \
-    VLLM_GPU_MEMORY_UTIL=0.9 \
-    VLLM_MAX_NUM_SEQS=1 \
-    VLLM_MAX_MODEL_LEN=262144 \
-    VLLM_ATTENTION_BACKEND=ROCM_ATTN \
-    VLLM_MM_ENCODER_ATTN_BACKEND=TRITON_ATTN \
-    VLLM_REASONING_PARSER=qwen3 \
-    VLLM_TOOL_CALL_PARSER=qwen3_coder \
-    VLLM_SPECULATIVE_CONFIG='{"method":"dflash","model":"z-lab/Qwen3.6-27B-DFlash","num_speculative_tokens":8}' \
-    VLLM_ASR_MODEL_ID=Qwen/Qwen3-ASR-8B \
-    VLLM_ASR_HOST_PORT=8000 \
-    VLLM_ASR_GPU_MEMORY_UTIL=0.9 \
-    VLLM_ASR_MAX_NUM_SEQS=1 \
-    VLLM_ASR_MAX_MODEL_LEN=8192 \
-    VLLM_ASR_SUPPORTED_TASKS=transcription,realtime
-
-# 11. Entrypoint — picks LLM or ASR service based on SERVICE_MODE env var.
-COPY scripts/entrypoint.sh /opt/entrypoint.sh
-RUN chmod +x /opt/entrypoint.sh
-
 WORKDIR /opt
-ENTRYPOINT ["/opt/entrypoint.sh"]
+CMD ["/bin/bash"]

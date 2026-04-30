@@ -87,20 +87,11 @@ jobs:
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           echo "### Image published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "# LLM service (port 8000)" >> $GITHUB_STEP_SUMMARY
-          echo "docker run -d --name vllm-llm --privileged \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --ipc host --shm-size 16gb -p 8000:8000 \\" >> $GITHUB_STEP_SUMMARY
-          echo "  -v /path/to/hf-cache:/models:ro \\" >> $GITHUB_STEP_SUMMARY
-          echo "  -e SERVICE_MODE=llm \\" >> $GITHUB_STEP_SUMMARY
-          echo "  ${IMAGE}:main" >> $GITHUB_STEP_SUMMARY
+          echo "Builds vLLM v0.20.0 from source with ROCm 7.13 nightly + 20 gfx1151 patches." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "# ASR service (port 8001)" >> $GITHUB_STEP_SUMMARY
-          echo "docker run -d --name vllm-asr --privileged \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --ipc host --shm-size 16gb -p 8001:8000 \\" >> $GITHUB_STEP_SUMMARY
-          echo "  -v /path/to/hf-cache:/models:ro \\" >> $GITHUB_STEP_SUMMARY
-          echo "  -e SERVICE_MODE=asr \\" >> $GITHUB_STEP_SUMMARY
-          echo "  ${IMAGE}:main" >> $GITHUB_STEP_SUMMARY
+          echo "Usage:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker compose build" >> $GITHUB_STEP_SUMMARY
+          echo "docker compose up -d vllm          # text LLM" >> $GITHUB_STEP_SUMMARY
+          echo "docker compose up -d vllm-asr       # ASR" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
