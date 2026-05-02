@@ -62,6 +62,7 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
 export HSA_NO_SCRATCH_RECLAIM=1
 export MIOPEN_FIND_MODE=FAST
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+export AOTRITON_PATH=/opt/rocm/aotriton
 export AMDGPU_TARGETS=${GFX}
 EOF
 chmod 0644 /etc/profile.d/rocm-sdk.sh

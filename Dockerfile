@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libatomic1 libnuma-dev libgomp1 libelf1t64 \
       libdrm-dev zlib1g-dev libssl-dev \
       libgoogle-perftools4 \
+      liblzma-dev \
       procps \
     && rm -rf /var/lib/apt/lists/*
 
@@ -67,6 +68,29 @@ RUN uv venv /opt/venv --python 3.12 && \
 RUN uv pip install --pre torch torchvision torchaudio \
       --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151/ && \
     rm -rf /root/.cache/uv /root/.cache/pip
+
+# 4b. AOTriton compilation — pre-compiles gfx1151 SDPA/attention kernels
+# so PyTorch's SDPA dispatch can use AOTriton instead of JIT-compiling
+# Triton kernels at runtime. Reduces cold-start time and avoids MIOpen
+# kernel search issues for non-32-aligned conv shapes.
+# Build: CMake+Ninja, target gfx1151, from ROCm/aotriton main.
+# AOTriton is a standalone library that PyTorch ROCm discovers at runtime
+# via TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (already set below).
+WORKDIR /tmp
+RUN git clone --depth 1 https://github.com/ROCm/aotriton.git /tmp/aotriton && \
+    cd /tmp/aotriton && \
+    mkdir -p build && cd build && \
+    cmake .. \
+      -DCMAKE_INSTALL_PREFIX=/opt/rocm/aotriton \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DAOTRITON_TARGET_ARCH=gfx1151 \
+      -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
+      -G Ninja && \
+    ninja install/strip && \
+    rm -rf /tmp/aotriton && \
+    echo "AOTriton installed to /opt/rocm/aotriton"
+
+WORKDIR /opt
 
 # 5. Build tool deps for the vLLM native build.
 RUN uv pip install --upgrade cmake ninja packaging wheel numpy \
@@ -170,6 +194,7 @@ ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib \
     HSA_NO_SCRATCH_RECLAIM=1 \
     MIOPEN_FIND_MODE=FAST \
     FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+    AOTRITON_PATH=/opt/rocm/aotriton \
     VLLM_ROCM_USE_AITER=0 \
     VLLM_USE_TRITON_AWQ=1 \
     VLLM_DISABLE_COMPILE_CACHE=1
