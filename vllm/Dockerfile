@@ -1,4 +1,4 @@
-# vllm-awq4-qwen source-build image  -  Ubuntu 26.04 + TheRock ROCm 7.13 nightly + vLLM from source.
+# rocm_gfx1151_vllm source-build image — Ubuntu 26.04 + TheRock ROCm 7.13 nightly + vLLM from source.
 #
 # Builds vLLM 0.20.0+ against TheRock ROCm 7.13 nightly for AMD Strix Halo
 # (gfx1151 / RDNA 3.5). Target model: cyankiwi/Qwen3.6-27B-AWQ-INT4
@@ -19,10 +19,14 @@
 #   - AITER custom build  : SKIPPED. Disabled at runtime via
 #                           VLLM_ROCM_USE_AITER=0; the patch bundle also
 #                           fences AITER FP8 / MoE / RMSNorm off on gfx1x.
+#   - AOTriton             : SKIPPED. Requires CMake 3.x (Ubuntu 26.04 ships
+#                           CMake 4.2 which breaks AOTriton's build system).
+#                           PyTorch 2.13 ROCm nightly uses Triton JIT-compiled
+#                           SDPA kernels at runtime instead.
 #   - Flash-Attention      : SKIPPED. ROCm/flash-attention main_perf HEAD
 #                           is a 2.2-3.7x ViT regression on gfx1151
 #                           (Dao-AILab/flash-attention#2392). vLLM's
-#                           TRITON_ATTN + AOTriton experimental SDPA is
+#                           TRITON_ATTN + Triton JIT SDPA is
 #                           the recommended path on RDNA 3.5.
 #   - bitsandbytes ROCm    : SKIPPED. AWQ via compressed-tensors.
 #   - Custom RCCL          : SKIPPED. Single-iGPU, no NCCL.
@@ -69,30 +73,9 @@ RUN uv pip install --pre torch torchvision torchaudio \
       --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151/ && \
     rm -rf /root/.cache/uv /root/.cache/pip
 
-# 4b. AOTriton compilation — pre-compiles gfx1151 SDPA/attention kernels
-# so PyTorch's SDPA dispatch can use AOTriton instead of JIT-compiling
-# Triton kernels at runtime. Reduces cold-start time and avoids MIOpen
-# kernel search issues for non-32-aligned conv shapes.
-# Build: CMake+Ninja, target gfx1151, from ROCm/aotriton main.
-# AOTriton is a standalone library that PyTorch ROCm discovers at runtime
-# via TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (already set below).
-WORKDIR /tmp
-RUN git clone --depth 1 https://github.com/ROCm/aotriton.git /tmp/aotriton && \
-    cd /tmp/aotriton && \
-    mkdir -p build && cd build && \
-    cmake .. \
-      -DCMAKE_INSTALL_PREFIX=/opt/rocm/aotriton \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DAOTRITON_TARGET_ARCH=gfx1151 \
-      -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
-      -G Ninja && \
-    ninja install/strip && \
-    rm -rf /tmp/aotriton && \
-    echo "AOTriton installed to /opt/rocm/aotriton"
-
 WORKDIR /opt
 
-# 5. Build tool deps for the vLLM native build.
+# 4b. vLLM native build tool deps.
 RUN uv pip install --upgrade cmake ninja packaging wheel numpy \
       "setuptools-scm>=8" "setuptools<80.0.0" scikit-build-core pybind11
 
@@ -186,7 +169,6 @@ RUN uv pip install av soundfile scipy && \
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib \
     HIP_CLANG_PATH=/opt/rocm/llvm/bin \
     ROCBLAS_USE_HIPBLASLT=1 \
-    TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
     HIP_FORCE_DEV_KERNARG=1 \
     RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1 \
     LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 \
@@ -194,7 +176,6 @@ ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib \
     HSA_NO_SCRATCH_RECLAIM=1 \
     MIOPEN_FIND_MODE=FAST \
     FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-    AOTRITON_PATH=/opt/rocm/aotriton \
     VLLM_ROCM_USE_AITER=0 \
     VLLM_USE_TRITON_AWQ=1 \
     VLLM_DISABLE_COMPILE_CACHE=1
